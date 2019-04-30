@@ -1,37 +1,3 @@
-/*
- * ORACLE PROPRIETARY/CONFIDENTIAL. Use is subject to license terms.
- *
- *
- *
- *
- *
- *
- *
- *
- *
- *
- *
- *
- *
- *
- *
- *
- *
- *
- *
- *
- */
-
-/*
- *
- *
- *
- *
- *
- * Written by Doug Lea with assistance from members of JCP JSR-166
- * Expert Group and released to the public domain, as explained at
- * http://creativecommons.org/publicdomain/zero/1.0/
- */
 
 package java.util.concurrent;
 import java.util.function.Supplier;
@@ -52,167 +18,37 @@ import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.locks.LockSupport;
 
-/**
- * A {@link Future} that may be explicitly completed (setting its
- * value and status), and may be used as a {@link CompletionStage},
- * supporting dependent functions and actions that trigger upon its
- * completion.
- *
- * <p>When two or more threads attempt to
- * {@link #complete complete},
- * {@link #completeExceptionally completeExceptionally}, or
- * {@link #cancel cancel}
- * a CompletableFuture, only one of them succeeds.
- *
- * <p>In addition to these and related methods for directly
- * manipulating status and results, CompletableFuture implements
- * interface {@link CompletionStage} with the following policies: <ul>
- *
- * <li>Actions supplied for dependent completions of
- * <em>non-async</em> methods may be performed by the thread that
- * completes the current CompletableFuture, or by any other caller of
- * a completion method.</li>
- *
- * <li>All <em>async</em> methods without an explicit Executor
- * argument are performed using the {@link ForkJoinPool#commonPool()}
- * (unless it does not support a parallelism level of at least two, in
- * which case, a new Thread is created to run each task).  To simplify
- * monitoring, debugging, and tracking, all generated asynchronous
- * tasks are instances of the marker interface {@link
- * AsynchronousCompletionTask}. </li>
- *
- * <li>All CompletionStage methods are implemented independently of
- * other public methods, so the behavior of one method is not impacted
- * by overrides of others in subclasses.  </li> </ul>
- *
- * <p>CompletableFuture also implements {@link Future} with the following
- * policies: <ul>
- *
- * <li>Since (unlike {@link FutureTask}) this class has no direct
- * control over the computation that causes it to be completed,
- * cancellation is treated as just another form of exceptional
- * completion.  Method {@link #cancel cancel} has the same effect as
- * {@code completeExceptionally(new CancellationException())}. Method
- * {@link #isCompletedExceptionally} can be used to determine if a
- * CompletableFuture completed in any exceptional fashion.</li>
- *
- * <li>In case of exceptional completion with a CompletionException,
- * methods {@link #get()} and {@link #get(long, TimeUnit)} throw an
- * {@link ExecutionException} with the same cause as held in the
- * corresponding CompletionException.  To simplify usage in most
- * contexts, this class also defines methods {@link #join()} and
- * {@link #getNow} that instead throw the CompletionException directly
- * in these cases.</li> </ul>
- *
- * @author Doug Lea
- * @since 1.8
- */
+/*
+    [类描述]
+        1、可以显式完成的 Future（设置其值和状态），并可以用作{@link CompletionStage}，支持在完成时触发的依赖函数和操作。
+        2、当两个或多个线程尝试{@link #complete complete}，{@ link #completeExceptionally completeExceptionally}或{@link #cancel cancel}一个CompletableFuture时，只有其中一个成功。
+        3、除了直接操作状态和结果的这些和相关方法之外，CompletableFuture还使用以下策略实现接口{@link CompletionStage}：
+            3.1、为<em>非异步</ em>方法的依赖完成提供的动作可以由完成当前CompletableFuture的线程执行，或者由完成方法的任何其他调用者执行。
+            3.2、没有显式Executor参数的所有<em> async </ em>方法都是使用{@link ForkJoinPool＃commonPool（）}执行的（除非它不支持至少两个并行级别，在这种情况下，新的Thread是创建用于运行每个任务）。为了简化监视，调试和跟踪，所有生成的异步任务都是标记接口{@link AsynchronousCompletionTask}的实例。
+            3.3、所有CompletionStage方法都是独立于其他公共方法实现的，因此一个方法的行为不会受到子类中其他方法的覆盖的影响。     
+        4、CompletableFuture还使用以下策略实现{@link Future}：
+            4.1、由于（不像{@link FutureTask}）这个类没有直接控制导致它完成的计算，因此取消被视为异常完成的另一种形式。方法{@link #cancel cancel}与{@code completeExceptionally（new CancellationException（））}具有相同的效果。方法{@link #isCompletedExceptionally}可用于确定CompletableFuture是否以任何异常方式完成。
+            4.2、如果使用CompletionException进行异常完成，方法{@link #get（）}和{@link #get（long，TimeUnit）}会抛出{@link ExecutionException}，其原因与相应的CompletionException中保存的原因相同。为了简化大多数上下文中的使用，此类还定义了方法{@link #join（）}和{@link #getNow}，它们在这些情况下直接抛出CompletionException。
+*/
+
 public class CompletableFuture<T> implements Future<T>, CompletionStage<T> {
 
     /*
-     * Overview:
-     *
-     * A CompletableFuture may have dependent completion actions,
-     * collected in a linked stack. It atomically completes by CASing
-     * a result field, and then pops off and runs those actions. This
-     * applies across normal vs exceptional outcomes, sync vs async
-     * actions, binary triggers, and various forms of completions.
-     *
-     * Non-nullness of field result (set via CAS) indicates done.  An
-     * AltResult is used to box null as a result, as well as to hold
-     * exceptions.  Using a single field makes completion simple to
-     * detect and trigger.  Encoding and decoding is straightforward
-     * but adds to the sprawl of trapping and associating exceptions
-     * with targets.  Minor simplifications rely on (static) NIL (to
-     * box null results) being the only AltResult with a null
-     * exception field, so we don't usually need explicit comparisons.
-     * Even though some of the generics casts are unchecked (see
-     * SuppressWarnings annotations), they are placed to be
-     * appropriate even if checked.
-     *
-     * Dependent actions are represented by Completion objects linked
-     * as Treiber stacks headed by field "stack". There are Completion
-     * classes for each kind of action, grouped into single-input
-     * (UniCompletion), two-input (BiCompletion), projected
-     * (BiCompletions using either (not both) of two inputs), shared
-     * (CoCompletion, used by the second of two sources), zero-input
-     * source actions, and Signallers that unblock waiters. Class
-     * Completion extends ForkJoinTask to enable async execution
-     * (adding no space overhead because we exploit its "tag" methods
-     * to maintain claims). It is also declared as Runnable to allow
-     * usage with arbitrary executors.
-     *
-     * Support for each kind of CompletionStage relies on a separate
-     * class, along with two CompletableFuture methods:
-     *
-     * * A Completion class with name X corresponding to function,
-     *   prefaced with "Uni", "Bi", or "Or". Each class contains
-     *   fields for source(s), actions, and dependent. They are
-     *   boringly similar, differing from others only with respect to
-     *   underlying functional forms. We do this so that users don't
-     *   encounter layers of adaptors in common usages. We also
-     *   include "Relay" classes/methods that don't correspond to user
-     *   methods; they copy results from one stage to another.
-     *
-     * * Boolean CompletableFuture method x(...) (for example
-     *   uniApply) takes all of the arguments needed to check that an
-     *   action is triggerable, and then either runs the action or
-     *   arranges its async execution by executing its Completion
-     *   argument, if present. The method returns true if known to be
-     *   complete.
-     *
-     * * Completion method tryFire(int mode) invokes the associated x
-     *   method with its held arguments, and on success cleans up.
-     *   The mode argument allows tryFire to be called twice (SYNC,
-     *   then ASYNC); the first to screen and trap exceptions while
-     *   arranging to execute, and the second when called from a
-     *   task. (A few classes are not used async so take slightly
-     *   different forms.)  The claim() callback suppresses function
-     *   invocation if already claimed by another thread.
-     *
-     * * CompletableFuture method xStage(...) is called from a public
-     *   stage method of CompletableFuture x. It screens user
-     *   arguments and invokes and/or creates the stage object.  If
-     *   not async and x is already complete, the action is run
-     *   immediately.  Otherwise a Completion c is created, pushed to
-     *   x's stack (unless done), and started or triggered via
-     *   c.tryFire.  This also covers races possible if x completes
-     *   while pushing.  Classes with two inputs (for example BiApply)
-     *   deal with races across both while pushing actions.  The
-     *   second completion is a CoCompletion pointing to the first,
-     *   shared so that at most one performs the action.  The
-     *   multiple-arity methods allOf and anyOf do this pairwise to
-     *   form trees of completions.
-     *
-     * Note that the generic type parameters of methods vary according
-     * to whether "this" is a source, dependent, or completion.
-     *
-     * Method postComplete is called upon completion unless the target
-     * is guaranteed not to be observable (i.e., not yet returned or
-     * linked). Multiple threads can call postComplete, which
-     * atomically pops each dependent action, and tries to trigger it
-     * via method tryFire, in NESTED mode.  Triggering can propagate
-     * recursively, so NESTED mode returns its completed dependent (if
-     * one exists) for further processing by its caller (see method
-     * postFire).
-     *
-     * Blocking methods get() and join() rely on Signaller Completions
-     * that wake up waiting threads.  The mechanics are similar to
-     * Treiber stack wait-nodes used in FutureTask, Phaser, and
-     * SynchronousQueue. See their internal documentation for
-     * algorithmic details.
-     *
-     * Without precautions, CompletableFutures would be prone to
-     * garbage accumulation as chains of Completions build up, each
-     * pointing back to its sources. So we null out fields as soon as
-     * possible (see especially method Completion.detach). The
-     * screening checks needed anyway harmlessly ignore null arguments
-     * that may have been obtained during races with threads nulling
-     * out fields.  We also try to unlink fired Completions from
-     * stacks that might never be popped (see method postFire).
-     * Completion fields need not be declared as final or volatile
-     * because they are only visible to other threads upon safe
-     * publication.
+     概述：
+      
+       1、CompletableFuture可能具有相关的完成操作，收集在链接堆栈中。它通过CASing结果字段以原子方式完成，然后弹出并运行这些操作。这适用于正常与异常结果，同步与异步动作，二进制触发器和各种形式的完成。
+       2、字段结果的非零值（通过CAS设置）表示已完成。 AltResult用于将null作为结果，以及保存异常。使用单个字段可以使检测和触发变得简单。编码和解码很简单，但会增加陷阱并将异常与目标相关联。较小的简化依赖于（静态）NIL（to box null results）是唯一具有null异常字段的AltResult，因此我们通常不需要进行显式比较。即使某些泛型类型转换未经检查（请参阅SuppressWarnings注释），即使经过检查，它们也是合适的。
+       3、相关动作由作为Treiber堆栈链接的Completion对象表示，该堆栈由字段“stack”为首。每种动作都有完成类，分为单输入（UniCompletion），双输入（BiCompletion），投影（BiCompletions使用两个输入中的两个（不是两个）），共享（CoCompletion，由两个中的第二个使用）来源），零输入源动作，以及解锁服务员的信号员。类完成扩展了ForkJoinTask以启用异步执行（不添加空间开销，因为我们利用其“标记”方法来维护声明）。它也被声明为Runnable以允许使用任意执行程序。
+       4、对每种CompletionStage的支持依赖于一个单独的类，以及两个CompletableFuture方法：
+        4.1、名称为X的Completion类，对应于function，以“Uni”，“Bi”或“Or”开头。每个类都包含源（s），操作和依赖项的字段。它们非常相似，仅与底层功能形式有所不同。我们这样做是为了让用户在常见用法中不会遇到适配器层。我们还包括与用户方法不对应的“Relay”类/方法;他们将结果从一个阶段复制到另一个阶段
+        4.2、Boolean CompletableFuture方法x（...）（例如uniApply）获取检查操作是否可触发所需的所有参数，然后运行操作或通过执行其Completion参数（如果存在）安排其异步执行。如果已知完成，则该方法返回true。
+        4.3、Completion 方法tryFire（int mode）使用其保持的参数调用关联的x方法，并在成功时清除。 mode参数允许tryFire被调用两次（SYNC，然后是ASYNC）;第一个在安排执行时屏蔽和捕获异常，第二个在从任务调用时触发异常。 （一些类不使用异步，因此采用略有不同的形式。）如果另一个线程声明了，则claim（）回调会抑制函数调用。
+        4.4、CompletableFuture方法xStage（...）从CompletableFuture x的公共阶段方法调用。它会筛选用户参数并调用和/或创建舞台对象。如果不是异步并且x已经完成，则立即执行操作。否则，创建完成c，推送到x的堆栈（除非完成），并通过c.tryFire启动或触发。如果x在推动时完成，这也包括可能的比赛。具有两个输入的类（例如BiApply）在推动动作时处理两者之间的比赛。第二个完成是CoCompletion指向第一个，共享，以便最多只执行一个动作。多重方法allOf和anyOf成对地形成完成树。
+       5、Note that the generic type parameters of methods vary according  to whether "this" is a source, dependent, or completion.
+          请注意，方法的泛型类型参数根据“this”是源，依赖还是完成而有所不同。
+       6、方法postComplete在完成时被调用，除非保证目标不可观察（即，尚未返回或链接）。 多个线程可以调用postComplete，它会自动弹出每个依赖操作，并尝试在NESTED模式下通过方法tryFire触发它。 触发可以递归传播，因此NESTED模式返回其完成的依赖（如果存在）以供其调用者进一步处理（请参阅postFire方法）。
+       7、阻塞方法get（）和join（）依赖于唤醒等待线程的Signaller Completions。 这些机制类似于FutureTask，Phaser和SynchronousQueue中使用的Treiber堆栈等待节点。 有关算法详细信息，请参阅其内部文档。
+       8、如果没有预防措施，CompletableFutures将容易进行垃圾堆积，因为完成链的堆积，每个都指向其源。 所以我们尽快使字段无效（特别参见方法Completion.detach）。 无论如何，筛选检查无害地忽略了在使用线程将字段置零的比赛期间可能获得的空参数。 我们还尝试从可能永远不会弹出的堆栈中取消链接已触发的完成（请参阅方法postFire）。 完成字段不需要声明为final或volatile，因为它们仅在安全发布时对其他线程可见。
      */
 
     volatile Object result;       // Either the result or boxed AltResult
@@ -226,66 +62,58 @@ public class CompletableFuture<T> implements Future<T>, CompletionStage<T> {
         return UNSAFE.compareAndSwapObject(this, STACK, cmp, val);
     }
 
-    /** Returns true if successfully pushed c onto stack. */
+    /** 如果成功将c推入堆栈，则返回true。 */
     final boolean tryPushStack(Completion c) {
         Completion h = stack;
         lazySetNext(c, h);
         return UNSAFE.compareAndSwapObject(this, STACK, h, c);
     }
 
-    /** Unconditionally pushes c onto stack, retrying if necessary. */
+    /** 无条件地将c推入堆栈，必要时重试。 */
     final void pushStack(Completion c) {
         do {} while (!tryPushStack(c));
     }
 
-    /* ------------- Encoding and decoding outcomes -------------- */
+    /* ------------- 编码和解码的结果 -------------- */
 
     static final class AltResult { // See above
-        final Throwable ex;        // null only for NIL
+        final Throwable ex;        // 仅对NIL为null
         AltResult(Throwable x) { this.ex = x; }
     }
 
-    /** The encoding of the null value. */
+    /** 空值的编码 */
     static final AltResult NIL = new AltResult(null);
 
-    /** Completes with the null value, unless already completed. */
+    /** 除非已经完成，否则使用null值完成。 */
     final boolean completeNull() {
-        return UNSAFE.compareAndSwapObject(this, RESULT, null,
-                                           NIL);
+        return UNSAFE.compareAndSwapObject(this, RESULT, null, NIL);
     }
 
-    /** Returns the encoding of the given non-exceptional value. */
+    /** 返回指定非异常值的编码。 */
     final Object encodeValue(T t) {
         return (t == null) ? NIL : t;
     }
 
-    /** Completes with a non-exceptional result, unless already completed. */
+    /** 除非已经完成，否则用非异常的结果完成 */
     final boolean completeValue(T t) {
-        return UNSAFE.compareAndSwapObject(this, RESULT, null,
-                                           (t == null) ? NIL : t);
+        return UNSAFE.compareAndSwapObject(this, RESULT, null, (t == null) ? NIL : t);
     }
 
     /**
-     * Returns the encoding of the given (non-null) exception as a
-     * wrapped CompletionException unless it is one already.
+     * 返回指定（非null）异常的编码作为包装的CompletionException 对象，除非它已经是一个CompletionException对象。
      */
     static AltResult encodeThrowable(Throwable x) {
-        return new AltResult((x instanceof CompletionException) ? x :
-                             new CompletionException(x));
+        return new AltResult((x instanceof CompletionException) ? x : new CompletionException(x));
     }
 
     /** Completes with an exceptional result, unless already completed. */
     final boolean completeThrowable(Throwable x) {
-        return UNSAFE.compareAndSwapObject(this, RESULT, null,
-                                           encodeThrowable(x));
+        return UNSAFE.compareAndSwapObject(this, RESULT, null, encodeThrowable(x));
     }
 
     /**
-     * Returns the encoding of the given (non-null) exception as a
-     * wrapped CompletionException unless it is one already.  May
-     * return the given Object r (which must have been the result of a
-     * source future) if it is equivalent, i.e. if this is a simple
-     * relay of an existing CompletionException.
+     * 返回给定（非null）异常的编码作为包装的CompletionException对象，除非它已经是一个CompletionException对象。
+     * 如果它是等效的，则可以返回给定的对象r(which must have been the result of a source future)
      */
     static Object encodeThrowable(Throwable x, Object r) {
         if (!(x instanceof CompletionException))
@@ -304,8 +132,7 @@ public class CompletableFuture<T> implements Future<T>, CompletionStage<T> {
      * existing CompletionException.
      */
     final boolean completeThrowable(Throwable x, Object r) {
-        return UNSAFE.compareAndSwapObject(this, RESULT, null,
-                                           encodeThrowable(x, r));
+        return UNSAFE.compareAndSwapObject(this, RESULT, null, encodeThrowable(x, r));
     }
 
     /**
@@ -378,50 +205,49 @@ public class CompletableFuture<T> implements Future<T>, CompletionStage<T> {
         return t;
     }
 
-    /* ------------- Async task preliminaries -------------- */
+    /* ------------- Async task preliminaries 异步任务预赛 -------------- */
 
     /**
-     * A marker interface identifying asynchronous tasks produced by
-     * {@code async} methods. This may be useful for monitoring,
-     * debugging, and tracking asynchronous activities.
-     *
-     * @since 1.8
+     * 标识{@code async}方法生成的异步任务的标记接口。
+     * 这可能对监视，调试和跟踪异步活动很有用。
      */
     public static interface AsynchronousCompletionTask {
     }
 
-    private static final boolean useCommonPool =
-        (ForkJoinPool.getCommonPoolParallelism() > 1);
+    private static final boolean useCommonPool = (ForkJoinPool.getCommonPoolParallelism() > 1);
 
     /**
-     * Default executor -- ForkJoinPool.commonPool() unless it cannot
-     * support parallelism.
+     * 默认执行程序 -  ForkJoinPool.commonPool（）除非它不能支持并行性。
      */
-    private static final Executor asyncPool = useCommonPool ?
-        ForkJoinPool.commonPool() : new ThreadPerTaskExecutor();
+    private static final Executor asyncPool = useCommonPool ? ForkJoinPool.commonPool() : new ThreadPerTaskExecutor();
 
-    /** Fallback if ForkJoinPool.commonPool() cannot support parallelism */
+    /**
+     * 如果ForkJoinPool.commonPool（）不能支持并行性，则回退
+     */
     static final class ThreadPerTaskExecutor implements Executor {
-        public void execute(Runnable r) { new Thread(r).start(); }
+        public void execute(Runnable r) {
+            new Thread(r).start();
+        }
     }
 
     /**
-     * Null-checks user executor argument, and translates uses of
-     * commonPool to asyncPool in case parallelism disabled.
+     * Null-checks 用户执行程序参数，并在禁用并行性的情况下将commonPool的用法转换为asyncPool。
      */
     static Executor screenExecutor(Executor e) {
         if (!useCommonPool && e == ForkJoinPool.commonPool())
             return asyncPool;
-        if (e == null) throw new NullPointerException();
+        if (e == null)
+            throw new NullPointerException();
         return e;
     }
 
     // Modes for Completion.tryFire. Signedness matters.
+    // Completion.tryFire的模式。 签名很重要。
     static final int SYNC   =  0;
     static final int ASYNC  =  1;
     static final int NESTED = -1;
 
-    /* ------------- Base Completion classes and operations -------------- */
+    /* ------------- Base Completion classes and operations 基本完成类和操作 -------------- */
 
     @SuppressWarnings("serial")
     abstract static class Completion extends ForkJoinTask<Void>
@@ -431,12 +257,15 @@ public class CompletableFuture<T> implements Future<T>, CompletionStage<T> {
         /**
          * Performs completion action if triggered, returning a
          * dependent that may need propagation, if one exists.
-         *
+         * 如果触发，则执行完成操作，返回可能需要传播的依赖项（如果存在）。
          * @param mode SYNC, ASYNC, or NESTED
          */
         abstract CompletableFuture<?> tryFire(int mode);
 
-        /** Returns true if possibly still triggerable. Used by cleanStack. */
+        /**
+         * Returns true if possibly still triggerable. Used by cleanStack.
+         * 如果可能仍然可触发，则返回true。 由cleanStack使用。
+         */
         abstract boolean isLive();
 
         public final void run()                { tryFire(ASYNC); }
@@ -450,8 +279,8 @@ public class CompletableFuture<T> implements Future<T>, CompletionStage<T> {
     }
 
     /**
-     * Pops and tries to trigger all reachable dependents.  Call only
-     * when known to be done.
+     * Pops and tries to trigger all reachable dependents.  Call only when known to be done.
+     * 弹出并尝试触发所有可到达的依赖项。 只有在知道完成时才会被调用。
      */
     final void postComplete() {
         /*
@@ -460,9 +289,11 @@ public class CompletableFuture<T> implements Future<T>, CompletionStage<T> {
          * pushing others to avoid unbounded recursion.
          */
         CompletableFuture<?> f = this; Completion h;
-        while ((h = f.stack) != null ||
-               (f != this && (h = (f = this).stack) != null)) {
-            CompletableFuture<?> d; Completion t;
+
+        while ((h = f.stack) != null || (f != this && (h = (f = this).stack) != null)) {
+            CompletableFuture<?> d;
+            Completion t;
+
             if (f.casStack(h, t = h.next)) {
                 if (t != null) {
                     if (f != this) {
@@ -607,15 +438,18 @@ public class CompletableFuture<T> implements Future<T>, CompletionStage<T> {
         return true;
     }
 
-    private <V> CompletableFuture<V> uniApplyStage(
-        Executor e, Function<? super T,? extends V> f) {
+    private <V> CompletableFuture<V> uniApplyStage(Executor e, Function<? super T,? extends V> f) {
+
         if (f == null) throw new NullPointerException();
+
         CompletableFuture<V> d =  new CompletableFuture<V>();
+
         if (e != null || !d.uniApply(this, f, null)) {
             UniApply<T,V> c = new UniApply<T,V>(e, d, this, f);
             push(c);
             c.tryFire(SYNC);
         }
+
         return d;
     }
 
@@ -1978,18 +1812,15 @@ public class CompletableFuture<T> implements Future<T>, CompletionStage<T> {
         return triggered;
     }
 
-    public <U> CompletableFuture<U> thenApply(
-        Function<? super T,? extends U> fn) {
+    public <U> CompletableFuture<U> thenApply(Function<? super T,? extends U> fn) {
         return uniApplyStage(null, fn);
     }
 
-    public <U> CompletableFuture<U> thenApplyAsync(
-        Function<? super T,? extends U> fn) {
+    public <U> CompletableFuture<U> thenApplyAsync(Function<? super T,? extends U> fn) {
         return uniApplyStage(asyncPool, fn);
     }
 
-    public <U> CompletableFuture<U> thenApplyAsync(
-        Function<? super T,? extends U> fn, Executor executor) {
+    public <U> CompletableFuture<U> thenApplyAsync(Function<? super T,? extends U> fn, Executor executor) {
         return uniApplyStage(screenExecutor(executor), fn);
     }
 
